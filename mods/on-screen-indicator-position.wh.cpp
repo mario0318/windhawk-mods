@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              on-screen-indicator-position
 // @name            On-Screen Indicator Position
-// @description     Put the volume, brightness and camera on-screen indicators anywhere on the screen, each in its own spot if you like, instead of the three positions Windows offers
-// @version         1.2.7
+// @description     Place the volume/brightness/camera on-screen indicator anywhere on the screen, not just the three positions Windows offers
+// @version         1.3.1
 // @author          mario0318
 // @github          https://github.com/mario0318
 // @include         explorer.exe
@@ -26,9 +26,7 @@ Windows lets you put it in one of three places: top left, top center, or bottom
 center.
 
 This mod replaces that with a full nine-point grid, any corner, any edge center,
-or dead center, plus a pixel offset for fine-tuning. Each kind of indicator can
-also be given a spot of its own, so the volume one can sit somewhere different
-from the brightness one.
+or dead center, plus a pixel offset for fine-tuning.
 
 The brightness indicator moved to the middle of the right edge:
 
@@ -55,10 +53,11 @@ as the main position** follows the setting above, so you only have to touch the 
 you want somewhere else. Handy if you want the volume indicator out of the way at the
 bottom but still want the camera one where you will notice it.
 
-Volume kept at the top left while brightness sits in the middle. Only one of them is
-ever on screen at a time, so this is the same desktop photographed twice:
+## How long it stays
 
-![Volume top left, brightness center](https://raw.githubusercontent.com/mario0318/windhawk-mods/628f80317652209d3feed54eadf9c329e77b04a7/on-screen-indicator-position/per-indicator.jpg)
+Windows decides when to take the indicator away again. **Seconds on screen** overrides
+that, so it can linger while you find the slider, or get out of the way sooner. Left at
+0 it keeps whatever Windows does.
 
 ## Choosing a monitor
 
@@ -76,9 +75,6 @@ a monitor by number or by interface name. The two work together.
 * Offsets are given at 100% scaling and scaled to whichever monitor the
   indicator appears on, so the same value moves the same distance on a display
   running at 150%.
-* With two indicators set to different spots you can catch the previous one
-  flashing at the new spot for a frame before the new one draws. That's the
-  confirmator reusing its frame, the placement hook can't do anything about it.
 * Tested on Windows 11 build 26200 (25H2) x64, on a 100% and a 150% display.
 
 ## Credits
@@ -95,9 +91,7 @@ both target the same function and work out the origin handling.
 /*
 - position: topRight
   $name: Position
-  $description: >-
-    Where on the screen the indicator appears. Anything left on "Same as the main
-    position" below follows this one.
+  $description: Where on the screen the indicator appears
   $options:
   - windowsDefault: Windows default (only apply the offsets)
   - topLeft: Top left
@@ -125,6 +119,11 @@ both target the same function and work out the origin handling.
     setting moves the same distance on a scaled display. The indicator is kept
     inside the area Windows lays it out in, so an offset that would push it past
     an edge stops at the edge instead.
+- durationSeconds: 0
+  $name: Seconds on screen
+  $description: >-
+    How long the indicator stays before it hides itself. 0 keeps whatever Windows
+    uses. The value is in seconds and anything from 1 to 60 is accepted.
 - perIndicator:
   - volume: same
     $name: Volume
@@ -255,24 +254,15 @@ enum class Indicator {
     microphone,
     text,
     count,
-    // Nothing has been shown yet, so there is no kind to look up and the main
-    // position is used.
+    // Nothing is on screen, or the entry point for whatever is on screen isn't
+    // hooked. Either way there is no kind to look up, so the main position is
+    // used rather than whatever happened to be shown last.
     unknown,
 };
 
 // Only one indicator is on screen at a time, and the entry point runs before the
 // position is worked out, so a single value is enough.
 std::atomic<Indicator> g_currentIndicator{Indicator::unknown};
-
-// Set when any of the per-kind entry points didn't resolve. The recorded kind is
-// then meaningless, since an unhooked kind would be placed using whichever kind
-// was recorded before it, so the overrides are ignored for the session and
-// everything uses the main position. Checked once at init rather than guessed at
-// per placement.
-std::atomic<bool> g_kindUnreliable{false};
-
-// Must match the `position` default in the settings block above.
-constexpr Position kDefaultPosition = Position::topRight;
 
 // Written from Wh_ModSettingsChanged on an arbitrary thread and read on the
 // confirmator's UI thread, so the members are atomic. Each field is still read
@@ -283,36 +273,21 @@ struct {
     std::atomic<Position> position;
     std::atomic<int> offsetX;
     std::atomic<int> offsetY;
-    // Position::windowsDefault means "no override", so the main position is used.
-    // It is never offered as a per-indicator choice, which leaves it free to be
-    // the sentinel. The main position keeps its own meaning of leaving Windows'
-    // spot alone.
+    std::atomic<int> durationSeconds;
+    // Position::windowsDefault here means "no override", so the main position is
+    // used. The main position keeps its own meaning of leaving Windows' spot be.
+    std::atomic<bool> perIndicatorSet[(size_t)Indicator::count];
     std::atomic<Position> perIndicator[(size_t)Indicator::count];
 } g_settings;
 
-bool AnyPerIndicator() {
-    for (size_t i = 0; i < (size_t)Indicator::count; i++) {
-        if (g_settings.perIndicator[i].load() != Position::windowsDefault) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 // The position to place the indicator that is being shown right now.
 Position CurrentPosition() {
-    if (g_kindUnreliable.load()) {
-        return g_settings.position.load();
+    size_t i = (size_t)g_currentIndicator.load();
+    if (i < (size_t)Indicator::count && g_settings.perIndicatorSet[i].load()) {
+        return g_settings.perIndicator[i].load();
     }
 
-    size_t i = (size_t)g_currentIndicator.load();
-    Position perIndicator = i < (size_t)Indicator::count
-                                ? g_settings.perIndicator[i].load()
-                                : Position::windowsDefault;
-
-    return perIndicator != Position::windowsDefault ? perIndicator
-                                                    : g_settings.position.load();
+    return g_settings.position.load();
 }
 
 HMODULE g_hardwareConfirmatorModule;
@@ -400,14 +375,13 @@ void PlaceInArea(const WinrtRect& area,
     }
 }
 
+
 // Each kind of indicator has its own entry point on the host, so the kind is
 // recorded as one is asked for and read back when the position is worked out.
 // They are private coroutines returning winrt::fire_and_forget, an empty struct,
 // so the return is passed through as the single byte it occupies. Every one is
-// hooked as optional, so a name that stops resolving on some build costs the per
-// indicator feature rather than the whole mod. Wh_ModInit checks afterwards that
-// all eight resolved, and if any didn't it ignores the overrides for the session
-// instead of placing one kind using another kind's spot.
+// hooked as optional: if a name stops resolving on some build, that kind just
+// falls back to the main position instead of the mod failing to load.
 
 using ShowVolumeAsync_t = char(WINAPI*)(void* pThis, int value);
 ShowVolumeAsync_t ShowVolumeAsync_Original;
@@ -453,10 +427,7 @@ char WINAPI ShowCameraAccessEnabledAsync_Hook(void* pThis, bool value) {
 
 // This one takes a message alongside the state on current builds and took only
 // the state on older ones. Declared with the extra parameter for both, since the
-// build that doesn't take it never reads the register it arrives in. That holds
-// because the mod is 64-bit only, x64 and arm64 both, where arguments go in
-// registers and the caller does the cleaning up. On a 32-bit stdcall build the
-// callee pops its own arguments and the same mismatch would walk the stack.
+// build that doesn't take it never reads the register it arrives in.
 using ShowMicrophoneMutedAsync_t = char(WINAPI*)(void* pThis,
                                                  int value,
                                                  void* text);
@@ -473,6 +444,94 @@ char WINAPI ShowTextAsync_Hook(void* pThis, void* text, bool value) {
     return ShowTextAsync_Original(pThis, text, value);
 }
 
+// Clearing the kind on hide is what makes the fallback above true: without it an
+// unhooked kind would inherit the position of whichever kind was shown last.
+using HideConfirmator_t = void(WINAPI*)(void* pThis);
+HideConfirmator_t HideConfirmator_Original;
+void WINAPI HideConfirmator_Hook(void* pThis) {
+    g_currentIndicator.store(Indicator::unknown);
+    return HideConfirmator_Original(pThis);
+}
+
+HideConfirmator_t HideConfirmatorWithoutAnimation_Original;
+void WINAPI HideConfirmatorWithoutAnimation_Hook(void* pThis) {
+    g_currentIndicator.store(Indicator::unknown);
+    return HideConfirmatorWithoutAnimation_Original(pThis);
+}
+
+// The indicator hides itself off a threadpool timer. Rewriting the due time of the
+// one the confirmator sets is what changes how long it stays. SetThreadpoolTimer is
+// used all over Explorer, so the setting is checked first and the caller second, and
+// a call from anywhere else is left completely alone.
+bool IsCallerTheConfirmator(void* returnAddress) {
+    HMODULE module;
+    return GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             (PCWSTR)returnAddress, &module) &&
+           module == g_hardwareConfirmatorModule;
+}
+
+// Only a relative due time within a plausible range is touched. A relative time is
+// negative, and the confirmator's own timers sit comfortably inside these bounds,
+// which keeps any other timer the DLL might set out of it.
+bool AdjustDueTime(void* returnAddress, PFILETIME due, FILETIME* adjusted) {
+    int seconds = g_settings.durationSeconds.load();
+    if (!seconds || !due) {
+        return false;
+    }
+
+    LARGE_INTEGER original;
+    original.LowPart = due->dwLowDateTime;
+    original.HighPart = (LONG)due->dwHighDateTime;
+    if (original.QuadPart >= 0) {
+        return false;  // An absolute time, not a countdown.
+    }
+
+    LONGLONG ms = -original.QuadPart / 10000;
+    if (ms < 250 || ms > 60000) {
+        return false;
+    }
+
+    if (!IsCallerTheConfirmator(returnAddress)) {
+        return false;
+    }
+
+    LARGE_INTEGER replacement;
+    replacement.QuadPart = -((LONGLONG)seconds * 10000000);
+    adjusted->dwLowDateTime = replacement.LowPart;
+    adjusted->dwHighDateTime = (DWORD)replacement.HighPart;
+    Wh_Log(L"Indicator timeout %lldms -> %dms", ms, seconds * 1000);
+    return true;
+}
+
+using SetThreadpoolTimer_t = decltype(&SetThreadpoolTimer);
+SetThreadpoolTimer_t SetThreadpoolTimer_Original;
+void WINAPI SetThreadpoolTimer_Hook(PTP_TIMER timer,
+                                    PFILETIME dueTime,
+                                    DWORD period,
+                                    DWORD windowLength) {
+    FILETIME adjusted;
+    if (AdjustDueTime(__builtin_return_address(0), dueTime, &adjusted)) {
+        dueTime = &adjusted;
+    }
+
+    return SetThreadpoolTimer_Original(timer, dueTime, period, windowLength);
+}
+
+using SetThreadpoolTimerEx_t = decltype(&SetThreadpoolTimerEx);
+SetThreadpoolTimerEx_t SetThreadpoolTimerEx_Original;
+BOOL WINAPI SetThreadpoolTimerEx_Hook(PTP_TIMER timer,
+                                      PFILETIME dueTime,
+                                      DWORD period,
+                                      DWORD windowLength) {
+    FILETIME adjusted;
+    if (AdjustDueTime(__builtin_return_address(0), dueTime, &adjusted)) {
+        dueTime = &adjusted;
+    }
+
+    return SetThreadpoolTimerEx_Original(timer, dueTime, period, windowLength);
+}
+
 using HardwareConfirmatorHost_GetPositionRect_t =
     WinrtRect*(WINAPI*)(void* pThis, WinrtRect* retval, const WinrtRect* rect);
 HardwareConfirmatorHost_GetPositionRect_t
@@ -481,7 +540,7 @@ WinrtRect* WINAPI
 HardwareConfirmatorHost_GetPositionRect_Hook(void* pThis,
                                              WinrtRect* retval,
                                              const WinrtRect* rect) {
-    Wh_Log(L"> indicator=%d", (int)g_currentIndicator.load());
+    Wh_Log(L">");
 
     // Read the offsets once so the placement below uses one consistent pair.
     int offsetSettingX = g_settings.offsetX.load();
@@ -566,25 +625,18 @@ Position PositionFromString(PCWSTR value) {
 void LoadSettings() {
     WindhawkUtils::StringSetting position =
         WindhawkUtils::StringSetting::make(L"position");
-    // Same reasoning as the per-indicator settings below. A setting that was
-    // never written reads back empty, which happens to every setting added by an
-    // update, so empty has to mean the default declared in the block rather than
-    // windowsDefault. Left as windowsDefault it would trip the "nothing to do"
-    // check in Wh_ModInit and the mod would sit there doing nothing.
-    PCWSTR storedPosition = position.get();
-    g_settings.position =
-        *storedPosition ? PositionFromString(storedPosition) : kDefaultPosition;
+    g_settings.position = PositionFromString(position.get());
 
     g_settings.offsetX = Wh_GetIntSetting(L"offsetX");
     g_settings.offsetY = Wh_GetIntSetting(L"offsetY");
 
+    int duration = Wh_GetIntSetting(L"durationSeconds");
+    g_settings.durationSeconds = (duration >= 1 && duration <= 60) ? duration : 0;
+
     static const PCWSTR kIndicatorSettings[] = {
-        L"perIndicator.volume",
-        L"perIndicator.brightness",
-        L"perIndicator.keyboardBrightness",
-        L"perIndicator.airplaneMode",
-        L"perIndicator.camera",
-        L"perIndicator.microphone",
+        L"perIndicator.volume",       L"perIndicator.brightness",
+        L"perIndicator.keyboardBrightness", L"perIndicator.airplaneMode",
+        L"perIndicator.camera",       L"perIndicator.microphone",
         L"perIndicator.text",
     };
     static_assert(ARRAYSIZE(kIndicatorSettings) == (size_t)Indicator::count);
@@ -592,10 +644,15 @@ void LoadSettings() {
     for (size_t i = 0; i < ARRAYSIZE(kIndicatorSettings); i++) {
         WindhawkUtils::StringSetting value =
             WindhawkUtils::StringSetting::make(kIndicatorSettings[i]);
-        // Both "same" and an unset value, which reads back empty, already come
-        // back as windowsDefault and neither is logged as unrecognised. That is
-        // the "no override" sentinel, so the main position applies.
-        g_settings.perIndicator[i] = PositionFromString(value.get());
+        // An unset setting reads back empty rather than as the declared
+        // default, so empty has to mean the same thing as "same". Without this
+        // every untouched indicator is pinned to the Windows default and the
+        // main position stops applying to any of them.
+        PCWSTR stored = value.get();
+        bool isSame = !*stored || wcscmp(stored, L"same") == 0;
+        g_settings.perIndicatorSet[i] = !isSame;
+        g_settings.perIndicator[i] =
+            isSame ? Position::windowsDefault : PositionFromString(stored);
     }
 }
 
@@ -607,10 +664,17 @@ BOOL Wh_ModInit() {
     // Nothing to place and nothing to nudge, so don't load the DLL or install a
     // hook that would only pass the rect straight through. Windhawk reloads the
     // mod after a settings change, so it comes back as soon as there is work.
-    bool anyPerIndicator = AnyPerIndicator();
+    bool anyPerIndicator = false;
+    for (size_t i = 0; i < (size_t)Indicator::count; i++) {
+        if (g_settings.perIndicatorSet[i]) {
+            anyPerIndicator = true;
+            break;
+        }
+    }
 
     if (g_settings.position == Position::windowsDefault && !anyPerIndicator &&
-        !g_settings.offsetX && !g_settings.offsetY) {
+        !g_settings.offsetX && !g_settings.offsetY &&
+        !g_settings.durationSeconds) {
         Wh_Log(L"Nothing to do");
         return FALSE;
     }
@@ -629,6 +693,18 @@ BOOL Wh_ModInit() {
             {LR"(private: struct winrt::Windows::Foundation::Rect __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::GetPositionRect(struct winrt::Windows::Foundation::Rect const &))"},
             &HardwareConfirmatorHost_GetPositionRect_Original,
             HardwareConfirmatorHost_GetPositionRect_Hook,
+        },
+        {
+            {LR"(public: void __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::HideConfirmator(void))"},
+            &HideConfirmator_Original,
+            HideConfirmator_Hook,
+            true,  // optional
+        },
+        {
+            {LR"(public: void __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::HideConfirmatorWithoutAnimation(void))"},
+            &HideConfirmatorWithoutAnimation_Original,
+            HideConfirmatorWithoutAnimation_Hook,
+            true,  // optional
         },
         {
             {LR"(private: struct winrt::fire_and_forget __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::ShowVolumeAsync(int))"},
@@ -683,79 +759,27 @@ BOOL Wh_ModInit() {
         },
     };
 
-    // All nine go in every time. The eight that record which kind is being shown
-    // are coroutine ramps that store a value and tail-call the original, so
-    // patching them when no kind has a spot of its own costs nothing worth
-    // measuring, and installing the same set every time keeps the symbol cache
-    // from being resolved again the first time someone turns an override on.
     if (!HookSymbols(g_hardwareConfirmatorModule, symbolHooks,
                      ARRAYSIZE(symbolHooks))) {
         Wh_Log(L"HookSymbols failed");
-        // Wh_ModUninit doesn't run when Wh_ModInit returns FALSE, so the
-        // reference taken above has to go back here.
-        FreeLibrary(g_hardwareConfirmatorModule);
-        g_hardwareConfirmatorModule = nullptr;
         return FALSE;
     }
 
-    // An optional symbol that isn't found leaves its original pointer alone, so
-    // a null here means that kind would never be recorded and every kind after
-    // it would be placed using a stale one. Rather than misplace an indicator,
-    // drop to the main position for everything and say so in the log.
-    const void* kindRecorders[] = {
-        (void*)ShowVolumeAsync_Original,
-        (void*)ShowBrightnessAsync_Original,
-        (void*)ShowKeyboardBrightnessAsync_Original,
-        (void*)ShowAirplaneModeOnAsync_Original,
-        (void*)ShowCameraOnAsync_Original,
-        (void*)ShowCameraAccessEnabledAsync_Original,
-        (void*)ShowMicrophoneMutedAsync_Original,
-        (void*)ShowTextAsync_Original,
-    };
-
-    for (const void* recorder : kindRecorders) {
-        if (!recorder) {
-            g_kindUnreliable = true;
-            // Only worth saying to someone who has an override set. With the
-            // shipped defaults there is nothing being ignored to complain about.
-            if (anyPerIndicator) {
-                Wh_Log(
-                    L"An indicator entry point didn't resolve, so the position "
-                    L"per indicator settings are ignored and everything uses "
-                    L"the main position");
-            }
-            break;
-        }
-    }
+    WindhawkUtils::SetFunctionHook(SetThreadpoolTimer, SetThreadpoolTimer_Hook,
+                                   &SetThreadpoolTimer_Original);
+    WindhawkUtils::SetFunctionHook(SetThreadpoolTimerEx,
+                                   SetThreadpoolTimerEx_Hook,
+                                   &SetThreadpoolTimerEx_Original);
 
     return TRUE;
 }
 
 void Wh_ModUninit() {
     Wh_Log(L">");
-
-    // The hooks are already gone by this point, so handing back the reference
-    // taken in Wh_ModInit is safe. Without this every enable and disable cycle
-    // leaves one behind.
-    if (g_hardwareConfirmatorModule) {
-        FreeLibrary(g_hardwareConfirmatorModule);
-        g_hardwareConfirmatorModule = nullptr;
-    }
 }
 
 void Wh_ModSettingsChanged() {
     Wh_Log(L">");
 
-    // Every hook is installed either way now, so nothing here needs a reload and
-    // a change takes effect on the next indicator.
     LoadSettings();
-
-    // Turning on the first override no longer re-runs Wh_ModInit, so this is the
-    // only place the person it concerns can still be told.
-    if (g_kindUnreliable && AnyPerIndicator()) {
-        Wh_Log(
-            L"An indicator entry point didn't resolve, so the position "
-            L"per indicator settings are ignored and everything uses "
-            L"the main position");
-    }
 }
