@@ -2,7 +2,7 @@
 // @id              on-screen-indicator-position
 // @name            On-Screen Indicator Position
 // @description     Put the volume, brightness and camera on-screen indicators anywhere on the screen, each in its own spot if you like, and optionally skip the slide out animation
-// @version         1.4.0
+// @version         1.4.1
 // @author          mario0318
 // @github          https://github.com/mario0318
 // @include         explorer.exe
@@ -55,6 +55,10 @@ position. Anything left on **Same as the main position** follows the setting abo
 so you only have to touch the ones you want somewhere else. Handy if you want the
 volume indicator out of the way at the bottom but still want the camera one where
 you will notice it.
+
+If you used **Plain text indicator** to place the "Desktop N" popup before 1.4.0,
+set **Virtual desktop name** to that spot after updating. It now has its own setting
+and otherwise follows the main position.
 
 Volume kept at the top left while brightness sits in the middle. Only one of them is
 ever on screen at a time, so this is the same desktop photographed twice:
@@ -454,64 +458,32 @@ void PlaceInArea(const WinrtRect& area,
     }
 }
 
-// The same eight kinds arrive here first. These are the com vtable entries the
-// interface is called through, so they run before the host's own entry points
-// and before the position is worked out, and they are still there on builds
-// where the host's private coroutines have been refactored away. Whichever of
-// the two fires first records the kind, and recording it twice for one showing
-// is harmless since both agree. They return an HRESULT rather than the
-// implementation's own return.
+// Both the public COM thunk and the host's private coroutine record the kind.
+// The thunk survives on builds where the private name moves; the coroutine is
+// retained as the fallback for builds where a thunk has moved instead.
+#define DEFINE_RECORDER_HOOK(name, returnType, kind, parameters, arguments) \
+    using name##_t = returnType(WINAPI*) parameters;                         \
+    name##_t name##_Original;                                                 \
+    returnType WINAPI name##_Hook parameters {                                \
+        g_currentIndicator.store(kind);                                       \
+        return name##_Original arguments;                                     \
+    }
 
-using ShowVolumeThunk_t = int(WINAPI*)(void* pThis, int value);
-ShowVolumeThunk_t ShowVolumeThunk_Original;
-int WINAPI ShowVolumeThunk_Hook(void* pThis, int value) {
-    g_currentIndicator.store(Indicator::volume);
-    return ShowVolumeThunk_Original(pThis, value);
-}
-
-using ShowBrightnessThunk_t = int(WINAPI*)(void* pThis, int value);
-ShowBrightnessThunk_t ShowBrightnessThunk_Original;
-int WINAPI ShowBrightnessThunk_Hook(void* pThis, int value) {
-    g_currentIndicator.store(Indicator::brightness);
-    return ShowBrightnessThunk_Original(pThis, value);
-}
-
-using ShowKeyboardBrightnessThunk_t = int(WINAPI*)(void* pThis, int value);
-ShowKeyboardBrightnessThunk_t ShowKeyboardBrightnessThunk_Original;
-int WINAPI ShowKeyboardBrightnessThunk_Hook(void* pThis, int value) {
-    g_currentIndicator.store(Indicator::keyboardBrightness);
-    return ShowKeyboardBrightnessThunk_Original(pThis, value);
-}
-
-using ShowAirplaneModeOnThunk_t = int(WINAPI*)(void* pThis, bool value);
-ShowAirplaneModeOnThunk_t ShowAirplaneModeOnThunk_Original;
-int WINAPI ShowAirplaneModeOnThunk_Hook(void* pThis, bool value) {
-    g_currentIndicator.store(Indicator::airplaneMode);
-    return ShowAirplaneModeOnThunk_Original(pThis, value);
-}
-
-using ShowCameraOnThunk_t = int(WINAPI*)(void* pThis, bool value);
-ShowCameraOnThunk_t ShowCameraOnThunk_Original;
-int WINAPI ShowCameraOnThunk_Hook(void* pThis, bool value) {
-    g_currentIndicator.store(Indicator::camera);
-    return ShowCameraOnThunk_Original(pThis, value);
-}
-
-using ShowCameraAccessEnabledThunk_t = int(WINAPI*)(void* pThis, bool value);
-ShowCameraAccessEnabledThunk_t ShowCameraAccessEnabledThunk_Original;
-int WINAPI ShowCameraAccessEnabledThunk_Hook(void* pThis, bool value) {
-    g_currentIndicator.store(Indicator::camera);
-    return ShowCameraAccessEnabledThunk_Original(pThis, value);
-}
-
-using ShowMicrophoneMutedThunk_t = int(WINAPI*)(void* pThis,
-                                                int state,
-                                                void* text);
-ShowMicrophoneMutedThunk_t ShowMicrophoneMutedThunk_Original;
-int WINAPI ShowMicrophoneMutedThunk_Hook(void* pThis, int state, void* text) {
-    g_currentIndicator.store(Indicator::microphone);
-    return ShowMicrophoneMutedThunk_Original(pThis, state, text);
-}
+DEFINE_RECORDER_HOOK(ShowVolumeThunk, int, Indicator::volume,
+                     (void* pThis, int value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowBrightnessThunk, int, Indicator::brightness,
+                     (void* pThis, int value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowKeyboardBrightnessThunk, int,
+                     Indicator::keyboardBrightness, (void* pThis, int value),
+                     (pThis, value));
+DEFINE_RECORDER_HOOK(ShowAirplaneModeOnThunk, int, Indicator::airplaneMode,
+                     (void* pThis, bool value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowCameraOnThunk, int, Indicator::camera,
+                     (void* pThis, bool value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowCameraAccessEnabledThunk, int, Indicator::camera,
+                     (void* pThis, bool value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowMicrophoneMutedThunk, int, Indicator::microphone,
+                     (void* pThis, int state, void* text), (pThis, state, text));
 
 // The virtual desktop name popup goes through the same ShowText entry point as
 // every other text indicator. The only thing that tells them apart at hook time
@@ -541,69 +513,37 @@ bool ReturnAddressIsTwinui(void* returnAddress) {
 // into a later plain text show on the same thread.
 thread_local bool g_textCallFromTwinui = false;
 
+struct ResetOnExit {
+    bool& flag;
+    ~ResetOnExit() { flag = false; }
+};
+
 using ShowTextThunk_t = int(WINAPI*)(void* pThis, void* text, bool value);
 ShowTextThunk_t ShowTextThunk_Original;
 int WINAPI ShowTextThunk_Hook(void* pThis, void* text, bool value) {
     bool fromTwinui = ReturnAddressIsTwinui(__builtin_return_address(0));
     g_textCallFromTwinui = fromTwinui;
+    ResetOnExit reset{g_textCallFromTwinui};
     g_currentIndicator.store(fromTwinui ? Indicator::virtualDesktop
                                         : Indicator::text);
-    int result = ShowTextThunk_Original(pThis, text, value);
-    g_textCallFromTwinui = false;
-    return result;
+    return ShowTextThunk_Original(pThis, text, value);
 }
 
-// Each kind of indicator has its own entry point on the host, so the kind is
-// recorded as one is asked for and read back when the position is worked out.
-// They are private coroutines returning winrt::fire_and_forget, an empty struct,
-// so the return is passed through as the single byte it occupies. Every one is
-// hooked as optional, so a name that stops resolving on some build costs the per
-// indicator feature rather than the whole mod. Wh_ModInit checks afterwards that
-// each kind can still be recognised by one layer or the other, and if any kind
-// has neither it ignores the overrides for the session instead of placing one
-// kind using another kind's spot.
-
-using ShowVolumeAsync_t = char(WINAPI*)(void* pThis, int value);
-ShowVolumeAsync_t ShowVolumeAsync_Original;
-char WINAPI ShowVolumeAsync_Hook(void* pThis, int value) {
-    g_currentIndicator.store(Indicator::volume);
-    return ShowVolumeAsync_Original(pThis, value);
-}
-
-using ShowBrightnessAsync_t = char(WINAPI*)(void* pThis, int value);
-ShowBrightnessAsync_t ShowBrightnessAsync_Original;
-char WINAPI ShowBrightnessAsync_Hook(void* pThis, int value) {
-    g_currentIndicator.store(Indicator::brightness);
-    return ShowBrightnessAsync_Original(pThis, value);
-}
-
-using ShowKeyboardBrightnessAsync_t = char(WINAPI*)(void* pThis, int value);
-ShowKeyboardBrightnessAsync_t ShowKeyboardBrightnessAsync_Original;
-char WINAPI ShowKeyboardBrightnessAsync_Hook(void* pThis, int value) {
-    g_currentIndicator.store(Indicator::keyboardBrightness);
-    return ShowKeyboardBrightnessAsync_Original(pThis, value);
-}
-
-using ShowAirplaneModeOnAsync_t = char(WINAPI*)(void* pThis, bool value);
-ShowAirplaneModeOnAsync_t ShowAirplaneModeOnAsync_Original;
-char WINAPI ShowAirplaneModeOnAsync_Hook(void* pThis, bool value) {
-    g_currentIndicator.store(Indicator::airplaneMode);
-    return ShowAirplaneModeOnAsync_Original(pThis, value);
-}
-
-using ShowCameraOnAsync_t = char(WINAPI*)(void* pThis, bool value);
-ShowCameraOnAsync_t ShowCameraOnAsync_Original;
-char WINAPI ShowCameraOnAsync_Hook(void* pThis, bool value) {
-    g_currentIndicator.store(Indicator::camera);
-    return ShowCameraOnAsync_Original(pThis, value);
-}
-
-using ShowCameraAccessEnabledAsync_t = char(WINAPI*)(void* pThis, bool value);
-ShowCameraAccessEnabledAsync_t ShowCameraAccessEnabledAsync_Original;
-char WINAPI ShowCameraAccessEnabledAsync_Hook(void* pThis, bool value) {
-    g_currentIndicator.store(Indicator::camera);
-    return ShowCameraAccessEnabledAsync_Original(pThis, value);
-}
+// Each name is optional. If neither layer resolves for a kind, Wh_ModInit
+// disables per-indicator placement rather than reuse a previous kind's spot.
+DEFINE_RECORDER_HOOK(ShowVolumeAsync, char, Indicator::volume,
+                     (void* pThis, int value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowBrightnessAsync, char, Indicator::brightness,
+                     (void* pThis, int value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowKeyboardBrightnessAsync, char,
+                     Indicator::keyboardBrightness, (void* pThis, int value),
+                     (pThis, value));
+DEFINE_RECORDER_HOOK(ShowAirplaneModeOnAsync, char, Indicator::airplaneMode,
+                     (void* pThis, bool value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowCameraOnAsync, char, Indicator::camera,
+                     (void* pThis, bool value), (pThis, value));
+DEFINE_RECORDER_HOOK(ShowCameraAccessEnabledAsync, char, Indicator::camera,
+                     (void* pThis, bool value), (pThis, value));
 
 // This one takes a message alongside the state on current builds and took only
 // the state on older ones. Declared with the extra parameter for both, since the
@@ -611,14 +551,8 @@ char WINAPI ShowCameraAccessEnabledAsync_Hook(void* pThis, bool value) {
 // because the mod is 64-bit only, x64 and arm64 both, where arguments go in
 // registers and the caller does the cleaning up. On a 32-bit stdcall build the
 // callee pops its own arguments and the same mismatch would walk the stack.
-using ShowMicrophoneMutedAsync_t = char(WINAPI*)(void* pThis,
-                                                 int value,
-                                                 void* text);
-ShowMicrophoneMutedAsync_t ShowMicrophoneMutedAsync_Original;
-char WINAPI ShowMicrophoneMutedAsync_Hook(void* pThis, int value, void* text) {
-    g_currentIndicator.store(Indicator::microphone);
-    return ShowMicrophoneMutedAsync_Original(pThis, value, text);
-}
+DEFINE_RECORDER_HOOK(ShowMicrophoneMutedAsync, char, Indicator::microphone,
+                     (void* pThis, int value, void* text), (pThis, value, text));
 
 using ShowTextAsync_t = char(WINAPI*)(void* pThis, void* text, bool value);
 ShowTextAsync_t ShowTextAsync_Original;
@@ -653,10 +587,7 @@ void WINAPI ConfirmatorHostControl_Hide_Hook(void* pThis) {
         // Restored however this returns. Hide is an implementation method rather
         // than an abi thunk, so an hresult_error coming out of it would otherwise
         // leave the flag latched and the setting dead for the rest of the session.
-        struct Restore {
-            bool& flag;
-            ~Restore() { flag = false; }
-        } restore{redirecting};
+        ResetOnExit reset{redirecting};
 
         redirecting = true;
         return ConfirmatorHostControl_HideWithoutAnimation_Original(pThis);
@@ -669,9 +600,7 @@ void WINAPI ConfirmatorHostControl_Hide_Hook(void* pThis) {
 // the hidden-pointer form on x64 and the HFA-in-registers form on ARM64.
 // Hand-rolling the hidden pointer worked on x64 but shifted every argument on
 // ARM64, where four floats are a homogeneous aggregate returned in s0-s3.
-// WinrtRect is four floats = 16 bytes. Both x64 and ARM64 return it via
-// hidden pointer, but the pointer slot differs by architecture and, on x64,
-// by compiler:
+// WinrtRect is four floats = 16 bytes:
 //
 //   - MSVC treats this as a non-static member function: RCX carries `this`,
 //     the hidden retval pointer goes in RDX, and the rect argument follows.
@@ -687,21 +616,12 @@ void WINAPI ConfirmatorHostControl_Hide_Hook(void* pThis) {
 // So the signature is declared per architecture: hand-rolled hidden pointer on
 // x64 to match MSVC's placement, compiler-managed return by value on ARM64 so
 // the compiler emits the HFA form.
-#if defined(_M_ARM64) || defined(__aarch64__)
-using HardwareConfirmatorHost_GetPositionRect_t =
-    WinrtRect(WINAPI*)(void* pThis, const WinrtRect& rect);
-HardwareConfirmatorHost_GetPositionRect_t
-    HardwareConfirmatorHost_GetPositionRect_Original;
-WinrtRect WINAPI
-HardwareConfirmatorHost_GetPositionRect_Hook(void* pThis,
-                                             const WinrtRect& rect) {
+void AdjustPositionRect(const WinrtRect& rect, WinrtRect* result) {
     Wh_Log(L"> indicator=%s", IndicatorName(g_currentIndicator.load()));
 
     int offsetSettingX = g_settings.offsetX.load();
     int offsetSettingY = g_settings.offsetY.load();
 
-    // Scale the offsets to the target monitor's DPI so the same number moves
-    // the same distance everywhere.
     if (offsetSettingX || offsetSettingY) {
         RECT areaRect{
             .left = (LONG)rect.X,
@@ -712,38 +632,45 @@ HardwareConfirmatorHost_GetPositionRect_Hook(void* pThis,
         HMONITOR monitor = MonitorFromRect(&areaRect, MONITOR_DEFAULTTONEAREST);
         UINT dpiX = 96;
         UINT dpiY = 96;
-        if (SUCCEEDED(GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY)) &&
+        if (SUCCEEDED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)) &&
             dpiX && dpiY) {
             offsetSettingX = MulDiv(offsetSettingX, dpiX, 96);
             offsetSettingY = MulDiv(offsetSettingY, dpiY, 96);
         }
     }
 
-    // Shift the input rect to 0,0 since the original function assumes that.
     WinrtRect shiftedRect = rect;
     float offsetX = shiftedRect.X;
     float offsetY = shiftedRect.Y;
     shiftedRect.X = 0;
     shiftedRect.Y = 0;
 
-    WinrtRect result = HardwareConfirmatorHost_GetPositionRect_Original(
-        pThis, shiftedRect);
-
     Position position = CurrentPosition();
-    bool anyPlacement = position != Position::windowsDefault || offsetSettingX ||
-                        offsetSettingY;
-
-    if (anyPlacement) {
-        PlaceInArea(shiftedRect, position, offsetSettingX, offsetSettingY,
-                    &result);
+    if (position != Position::windowsDefault || offsetSettingX || offsetSettingY) {
+        PlaceInArea(shiftedRect, position, offsetSettingX, offsetSettingY, result);
     }
 
-    result.X += offsetX;
-    result.Y += offsetY;
+    result->X += offsetX;
+    result->Y += offsetY;
+}
+
+#undef DEFINE_RECORDER_HOOK
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+using HardwareConfirmatorHost_GetPositionRect_t =
+    WinrtRect(WINAPI*)(void* pThis, const WinrtRect& rect);
+HardwareConfirmatorHost_GetPositionRect_t
+    HardwareConfirmatorHost_GetPositionRect_Original;
+WinrtRect WINAPI
+HardwareConfirmatorHost_GetPositionRect_Hook(void* pThis,
+                                             const WinrtRect& rect) {
+    WinrtRect result = HardwareConfirmatorHost_GetPositionRect_Original(
+        pThis, WinrtRect{0, 0, rect.Width, rect.Height});
+    AdjustPositionRect(rect, &result);
 
     return result;
 }
-#else
+#elif defined(_M_X64) || defined(__x86_64__)
 using HardwareConfirmatorHost_GetPositionRect_t =
     WinrtRect*(WINAPI*)(void* pThis, WinrtRect* retval, const WinrtRect* rect);
 HardwareConfirmatorHost_GetPositionRect_t
@@ -752,56 +679,19 @@ WinrtRect* WINAPI
 HardwareConfirmatorHost_GetPositionRect_Hook(void* pThis,
                                              WinrtRect* retval,
                                              const WinrtRect* rect) {
-    Wh_Log(L"> indicator=%s", IndicatorName(g_currentIndicator.load()));
-
-    int offsetSettingX = g_settings.offsetX.load();
-    int offsetSettingY = g_settings.offsetY.load();
-
-    // Scale the offsets to the target monitor's DPI so the same number moves
-    // the same distance everywhere.
-    if (offsetSettingX || offsetSettingY) {
-        RECT areaRect{
-            .left = (LONG)rect->X,
-            .top = (LONG)rect->Y,
-            .right = (LONG)(rect->X + rect->Width),
-            .bottom = (LONG)(rect->Y + rect->Height),
-        };
-        HMONITOR monitor = MonitorFromRect(&areaRect, MONITOR_DEFAULTTONEAREST);
-        UINT dpiX = 96;
-        UINT dpiY = 96;
-        if (SUCCEEDED(GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY)) &&
-            dpiX && dpiY) {
-            offsetSettingX = MulDiv(offsetSettingX, dpiX, 96);
-            offsetSettingY = MulDiv(offsetSettingY, dpiY, 96);
-        }
-    }
-
-    // Shift the input rect to 0,0 since the original function assumes that.
-    WinrtRect shiftedRect = *rect;
-    float offsetX = shiftedRect.X;
-    float offsetY = shiftedRect.Y;
-    shiftedRect.X = 0;
-    shiftedRect.Y = 0;
+    WinrtRect shiftedRect{0, 0, rect->Width, rect->Height};
 
     WinrtRect* result = HardwareConfirmatorHost_GetPositionRect_Original(
         pThis, retval, &shiftedRect);
 
     if (result) {
-        Position position = CurrentPosition();
-        bool anyPlacement = position != Position::windowsDefault ||
-                            offsetSettingX || offsetSettingY;
-
-        if (anyPlacement) {
-            PlaceInArea(shiftedRect, position, offsetSettingX,
-                        offsetSettingY, result);
-        }
-
-        result->X += offsetX;
-        result->Y += offsetY;
+        AdjustPositionRect(*rect, result);
     }
 
     return result;
 }
+#else
+#error "Unsupported architecture"
 #endif
 
 Position PositionFromString(PCWSTR value) {
