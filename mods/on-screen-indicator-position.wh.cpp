@@ -2,7 +2,7 @@
 // @id              on-screen-indicator-position
 // @name            On-Screen Indicator Position
 // @description     Put the volume, brightness and camera on-screen indicators anywhere on the screen, each in its own spot if you like, and optionally skip the slide out animation
-// @version         1.4.1
+// @version         1.4.2
 // @author          mario0318
 // @github          https://github.com/mario0318
 // @include         explorer.exe
@@ -96,8 +96,9 @@ a monitor by number or by interface name. The two work together.
   lands at the new spot is the tail end of the previous indicator instead of an
   empty frame.
 * Tested on Windows 11 build 26200 (25H2) x64, on a 100% and a 150% display.
-  ARM64 hasn't been tested; the position lookup follows a different calling
-  convention there, so if you run it on ARM64 please let me know how it goes.
+  The ARM64 hooks were checked against the disassembly of the confirmator DLL
+  but not run on hardware, so if you use it there please let me know how it
+  goes.
 
 ## Credits
 
@@ -529,21 +530,35 @@ int WINAPI ShowTextThunk_Hook(void* pThis, void* text, bool value) {
     return ShowTextThunk_Original(pThis, text, value);
 }
 
-// Each name is optional. If neither layer resolves for a kind, Wh_ModInit
-// disables per-indicator placement rather than reuse a previous kind's spot.
-DEFINE_RECORDER_HOOK(ShowVolumeAsync, char, Indicator::volume,
-                     (void* pThis, int value), (pThis, value));
-DEFINE_RECORDER_HOOK(ShowBrightnessAsync, char, Indicator::brightness,
-                     (void* pThis, int value), (pThis, value));
-DEFINE_RECORDER_HOOK(ShowKeyboardBrightnessAsync, char,
-                     Indicator::keyboardBrightness, (void* pThis, int value),
-                     (pThis, value));
-DEFINE_RECORDER_HOOK(ShowAirplaneModeOnAsync, char, Indicator::airplaneMode,
-                     (void* pThis, bool value), (pThis, value));
-DEFINE_RECORDER_HOOK(ShowCameraOnAsync, char, Indicator::camera,
-                     (void* pThis, bool value), (pThis, value));
-DEFINE_RECORDER_HOOK(ShowCameraAccessEnabledAsync, char, Indicator::camera,
-                     (void* pThis, bool value), (pThis, value));
+// Each of these is winrt::fire_and_forget, an empty struct but not a trivial
+// one, so MSVC still returns it through a hidden pointer rather than in a
+// register: `this` first, the hidden retval pointer next, then the source
+// arguments, with the pointer handed back as the return value. A signature
+// without that slot compiles and links, but every real argument then arrives
+// one register late and the original coroutine gets called with garbage
+// where it expects its own arguments to be — this shipped for a session
+// before a maintainer caught it from the disassembly. Each name is optional;
+// if neither layer resolves for a kind, Wh_ModInit disables per-indicator
+// placement rather than reuse a previous kind's spot.
+DEFINE_RECORDER_HOOK(ShowVolumeAsync, void*, Indicator::volume,
+                     (void* pThis, void* retval, int value),
+                     (pThis, retval, value));
+DEFINE_RECORDER_HOOK(ShowBrightnessAsync, void*, Indicator::brightness,
+                     (void* pThis, void* retval, int value),
+                     (pThis, retval, value));
+DEFINE_RECORDER_HOOK(ShowKeyboardBrightnessAsync, void*,
+                     Indicator::keyboardBrightness,
+                     (void* pThis, void* retval, int value),
+                     (pThis, retval, value));
+DEFINE_RECORDER_HOOK(ShowAirplaneModeOnAsync, void*, Indicator::airplaneMode,
+                     (void* pThis, void* retval, bool value),
+                     (pThis, retval, value));
+DEFINE_RECORDER_HOOK(ShowCameraOnAsync, void*, Indicator::camera,
+                     (void* pThis, void* retval, bool value),
+                     (pThis, retval, value));
+DEFINE_RECORDER_HOOK(ShowCameraAccessEnabledAsync, void*, Indicator::camera,
+                     (void* pThis, void* retval, bool value),
+                     (pThis, retval, value));
 
 // This one takes a message alongside the state on current builds and took only
 // the state on older ones. Declared with the extra parameter for both, since the
@@ -551,15 +566,22 @@ DEFINE_RECORDER_HOOK(ShowCameraAccessEnabledAsync, char, Indicator::camera,
 // because the mod is 64-bit only, x64 and arm64 both, where arguments go in
 // registers and the caller does the cleaning up. On a 32-bit stdcall build the
 // callee pops its own arguments and the same mismatch would walk the stack.
-DEFINE_RECORDER_HOOK(ShowMicrophoneMutedAsync, char, Indicator::microphone,
-                     (void* pThis, int value, void* text), (pThis, value, text));
+DEFINE_RECORDER_HOOK(ShowMicrophoneMutedAsync, void*, Indicator::microphone,
+                     (void* pThis, void* retval, int value, void* text),
+                     (pThis, retval, value, text));
 
-using ShowTextAsync_t = char(WINAPI*)(void* pThis, void* text, bool value);
+using ShowTextAsync_t = void*(WINAPI*)(void* pThis,
+                                       void* retval,
+                                       void* text,
+                                       bool value);
 ShowTextAsync_t ShowTextAsync_Original;
-char WINAPI ShowTextAsync_Hook(void* pThis, void* text, bool value) {
+void* WINAPI ShowTextAsync_Hook(void* pThis,
+                                void* retval,
+                                void* text,
+                                bool value) {
     g_currentIndicator.store(g_textCallFromTwinui ? Indicator::virtualDesktop
                                                   : Indicator::text);
-    return ShowTextAsync_Original(pThis, text, value);
+    return ShowTextAsync_Original(pThis, retval, text, value);
 }
 
 // The control hides itself two ways and Windows picks the animated one. Handing the
@@ -596,26 +618,6 @@ void WINAPI ConfirmatorHostControl_Hide_Hook(void* pThis) {
     return ConfirmatorHostControl_Hide_Original(pThis);
 }
 
-// Declared with the platform's own return convention so the compiler produces
-// the hidden-pointer form on x64 and the HFA-in-registers form on ARM64.
-// Hand-rolling the hidden pointer worked on x64 but shifted every argument on
-// ARM64, where four floats are a homogeneous aggregate returned in s0-s3.
-// WinrtRect is four floats = 16 bytes:
-//
-//   - MSVC treats this as a non-static member function: RCX carries `this`,
-//     the hidden retval pointer goes in RDX, and the rect argument follows.
-//   - Clang targeting x86_64-w64-mingw32 sees the WINAPI-declared type as a
-//     free function and puts the hidden retval pointer in RCX with `this` in
-//     RDX. The MSVC-compiled explorer.exe caller expects the MSVC layout, so
-//     the compiler-managed return-by-value form writes the result to what the
-//     caller was using as `this`. The shell crashes on the first call.
-//   - ARM64 uses AAPCS64: four floats are a Homogeneous Floating-point
-//     Aggregate returned in s0-s3 with no hidden pointer at all, so the
-//     compiler-managed form emits exactly what the target expects.
-//
-// So the signature is declared per architecture: hand-rolled hidden pointer on
-// x64 to match MSVC's placement, compiler-managed return by value on ARM64 so
-// the compiler emits the HFA form.
 void AdjustPositionRect(const WinrtRect& rect, WinrtRect* result) {
     Wh_Log(L"> indicator=%s", IndicatorName(g_currentIndicator.load()));
 
@@ -656,21 +658,15 @@ void AdjustPositionRect(const WinrtRect& rect, WinrtRect* result) {
 
 #undef DEFINE_RECORDER_HOOK
 
-#if defined(_M_ARM64) || defined(__aarch64__)
-using HardwareConfirmatorHost_GetPositionRect_t =
-    WinrtRect(WINAPI*)(void* pThis, const WinrtRect& rect);
-HardwareConfirmatorHost_GetPositionRect_t
-    HardwareConfirmatorHost_GetPositionRect_Original;
-WinrtRect WINAPI
-HardwareConfirmatorHost_GetPositionRect_Hook(void* pThis,
-                                             const WinrtRect& rect) {
-    WinrtRect result = HardwareConfirmatorHost_GetPositionRect_Original(
-        pThis, WinrtRect{0, 0, rect.Width, rect.Height});
-    AdjustPositionRect(rect, &result);
-
-    return result;
-}
-#elif defined(_M_X64) || defined(__x86_64__)
+// winrt::Windows::Foundation::Rect has a user-provided constructor, so MSVC
+// returns it through a hidden pointer rather than in registers on both
+// architectures it's built for here: `this` first, the hidden retval pointer
+// next, then the rect argument (RCX/RDX/R8 on x64, x0/x1/x2 on ARM64), with
+// the pointer handed back as the return value. Confirmed against the ARM64
+// binary's disassembly, not just inferred from the ABI docs, since the
+// mismatch is exactly the kind of thing that looks plausible and crashes the
+// shell on the first call. One signature covers both, so there's nothing to
+// branch on here.
 using HardwareConfirmatorHost_GetPositionRect_t =
     WinrtRect*(WINAPI*)(void* pThis, WinrtRect* retval, const WinrtRect* rect);
 HardwareConfirmatorHost_GetPositionRect_t
@@ -690,9 +686,6 @@ HardwareConfirmatorHost_GetPositionRect_Hook(void* pThis,
 
     return result;
 }
-#else
-#error "Unsupported architecture"
-#endif
 
 Position PositionFromString(PCWSTR value) {
     if (wcscmp(value, L"topLeft") == 0) {
